@@ -9,6 +9,6 @@ target_compile_features(kcv INTERFACE cxx_std_17)
 
 # Top-level build
 if (CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
-	add_subdirectory("extern/catch2")
+	add_subdirectory("extern/doctest")
 	add_subdirectory("test")
 endif ()

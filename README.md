@@ -4,11 +4,11 @@ kcv-cpp
 A lightweight [KCV] library for C++17.
 
 - Only depends on the standard library
-- Does not throw exceptions (the underlying
-  standard classes may throw `std::bad_alloc`)
+- Does not throw exceptions (the underlying standard
+  classes may throw when they run out of memory)
 - Fully validates the format and encoding
-- Efficient memory usage
 - Logarithmic item lookup
+- Efficient read-only version
 - Single header
 - Hassle-free [Boost Software License]
 
@@ -22,21 +22,21 @@ Example
 Read and write values:
 
 ```cpp
-kcv::Document doc{"B:yes I:21"};
+kcv::Document doc{"Hello:no World:21"};
 
 bool b{};
 int  i{};
 
-doc["B"] >> b;
-doc["I"] >> i;
+doc["Hello"] >> b;
+doc["World"] >> i;
 
-doc["B"] << !b;
-doc["I"] << i*2;
+doc["Hello"] << !b;
+doc["World"] << i*2;
 
 std::cout << doc.dump();
 
-// B: no
-// I: 42
+// Hello: yes
+// World: 42
 ```
 
 Read or write multiple values per item:
@@ -49,8 +49,7 @@ int   i{};
 
 doc["foo"] >> f >> i;
 
-std::cout << f << "\n";
-std::cout << i << "\n";
+std::cout << f << "\n" << i << "\n";
 
 // 3.14
 // 42
@@ -59,7 +58,7 @@ std::cout << i << "\n";
 Read an unkown number of values:
 
 ```cpp
-kcv::Document doc{"foo: 5 42 127"};
+kcv::Document doc{"foo: 5 42 100"};
 kcv::Item item{doc["foo"]};
 
 for (int i{}; item >> i; )
@@ -67,7 +66,7 @@ for (int i{}; item >> i; )
 
 // 5
 // 42
-// 127
+// 100
 ```
 
 Write formatted values:
@@ -92,34 +91,29 @@ std::cout << doc.dump();
 Interface
 ---------
 
-The Document class manages a string buffer and
-provides access to the items.
+The Document class manages the data and provides access
+to the items. Item lookup has logarithmic complexity.
 
 ```cpp
 class Document
 {
+	public:
+
 	// Constructs an empty document.
 	Document()
 
-	// Takes ownership of a KCV string and parses it.
-	// If the parsing fails, or the non-zero maxItemCount
-	// is exceeded, an empty document is constructed instead.
-	// The string size is limited to 4 GiB.
-	explicit Document(std::string data, std::size_t maxItemCount = 0)
+	// Parses a KCV string. If the parsing fails, or the non-zero
+	// maxItemCount is exceeded, an empty document is constructed.
+	explicit Document(std::string_view data, std::size_t maxItemCount = 0)
 
 	// Checks if the constructor accepted the data string.
 	explicit operator bool() const
 
-	// Retrieves an item. If the key does not exist, a new
-	// item is inserted. If the key is invalid, or the non-zero
-	// maxItemCount is exceeded, an inactive item is returned.
-	//
-	// IMPORTANT: Only use the most recent Item instance.
-	// Old Item instances may contain invalidated references.
-	//
+	// Retrieves an item. If the key does not exist, a new item is
+	// inserted. If the key is invalid, an inactive item is returned.
 	Item operator[](std::string_view key)
 
-	// Converts the document to a string.
+	// Writes the document to a string.
 	// The items are ordered lexicographically.
 	std::string dump() const
 };
@@ -132,22 +126,25 @@ Items are robust and can be used without error-checking.
 ```cpp
 class Item
 {
+	public:
+
 	// Checks if the item is active after construction,
-	// or if the previous read or write was successul.
+	// or if the most recent read or write was successul.
 	explicit operator bool() const
 
 	// Reads the next value and assigns it to a standard bool,
 	// integral, floating-point, string, or string_view variable.
 	// If the read fails, the target variable is left unchanged.
-	// A string_view cannot contain any escape sequence and only
-	// remains valid until the document is altered.
-	// The read position is reset after each write.
+	// A string_view cannot contain any escape sequence and
+	// remains valid until the item is altered.
+	// Resets the write position.
 	Item& operator>>(T& target)
 
 	// Appends a standard bool, integral, floating-point,
 	// string, or string_view value. Invalid values are ignored.
-	// For strings, any double quote or backslash is escaped.
+	// Within strings, any double quote or backslash is escaped.
 	// The write position is reset after each read.
+	// Resets the read position.
 	Item& operator<<(const T& value)
 };
 ```
@@ -176,21 +173,43 @@ sp(int count = 1)
 tab(int count = 1)
 ```
 
+Read-only
+---------
 
-Complexity
-----------
+The `DocumentView` class is an efficient, read-only
+implementation that does not own or allocate data.
+It provides the same interface, but cannot create
+new items or write values.
 
-- Document construction: `O(chars + items*log(items))`
-- Item lookup: `O(log(items))`
+```cpp
+template<std::size_t MaxItemCount>
+class DocumentView
+{
+	public:
 
-The document content is stored in a single `std::string` buffer. 
-Additionally, the library maintains 128 bits of metadata per item
-in a sorted `std::vector`. Values are read and written in-place.
+	DocumentView()
+	explicit DocumentView(std::string_view data)
 
-To minimize the number of allocations, the `maxItemCount` parameter
-is used to reserve enough space upfront for the metadata. Also, the
-expected buffer size can be reserved in the `data` string before it
-is moved to the document constructor.
+	explicit operator bool() const
+	ItemView operator[](std::string_view key)
+};
+
+class ItemView
+{
+	public:
+
+	explicit operator bool() const
+	ItemView& operator>>(T& target)
+};
+```
+
+Note that it only remains valid as long as the
+provided data string_view is valid.
+
+It stores MaxItemCount*64 bits of metadata on the stack.
+The data string size is limited to 4 GiB, the item
+size to 16 MiB, and the key size to 255 bytes.
+Item lookup has logarithmic complexity.
 
 
 Install

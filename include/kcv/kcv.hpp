@@ -1,4 +1,4 @@
-// kcv-cpp 0.1.0
+// kcv-cpp 0.2.0
 // A lightweight KCV library for C++17
 // https://github.com/sevmeyer/kcv-cpp
 //
@@ -37,47 +37,24 @@
 #include <cstddef>      // size_t
 #include <cstdint>      // uint32_t
 #include <cstdlib>      // strtod
-#include <cstring>      // memcpy
 #include <algorithm>    // adjacent_find, clamp, lower_bound, max, min, sort
 #include <array>        // array
 #include <charconv>     // from_chars, to_chars
+#include <functional>   // less
 #include <locale>       // locale
 #include <limits>       // numeric_limits
+#include <map>          // map
 #include <sstream>      // fixed, ostringstream
 #include <string>       // string
 #include <string_view>  // string_view
 #include <system_error> // errc
 #include <type_traits>  // enable_if, is_floating_point, is_integral, is_unsigned
 #include <utility>      // move
-#include <vector>       // vector
 
 
 namespace kcv    {
 namespace detail {
 
-
-// .----------.   .-----------.   .-------------.
-// | Document |-->|  Buffer   |-->| std::string |
-// '----------'   '-----------'   '-------------'
-//                  ^       |           ^
-//                  .       v           .
-// .----------.     .  .-------------.  .
-// |   Item   |- - -   | std::vector |  .
-// '----------'     .  '-------------'  .
-//      |           .       |           .
-//      |           v       v           .
-//      |         .-----------.         .
-//      |         |  Lookup   |         .
-//      |         '-----------'         .
-//      |                               .
-//      |         .-----------.   .--------.
-//      '-------->| Tokenizer |-->| Stream |
-//                '-----------'   '--------'
-// ----> Ownership
-// - - > Reference
-
-
-using Size = std::uint32_t;
 
 template<typename T>
 using IsInt = typename std::enable_if_t<
@@ -93,17 +70,7 @@ using IsFloat = typename std::enable_if_t<
 
 inline bool isWs(char c)
 {
-	return c == ' '
-		|| c == '\t'
-		|| c == '\n'
-		|| c == '\r';
-}
-
-inline bool isNonNlWs(char c)
-{
-	return c == ' '
-		|| c == '\t'
-		|| c == '\r';
+	return c == ' ' || c == '\n' || c == '\r' || c == '\t';
 }
 
 inline bool isDigit(char c)
@@ -111,42 +78,19 @@ inline bool isDigit(char c)
 	return ('0' <= c && c <= '9');
 }
 
-inline bool isHexdig(char c)
-{
-	return ('0' <= c && c <= '9')
-		|| ('A' <= c && c <= 'F')
-		|| ('a' <= c && c <= 'f');
-}
-
 inline bool isAlpha(char c)
 {
-	return ('a' <= c && c <= 'z')
-		|| ('A' <= c && c <= 'Z');
+	return ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z');
+}
+
+inline bool isHexdig(char c)
+{
+	return isDigit(c) || ('A' <= c && c <= 'F') || ('a' <= c && c <= 'f');
 }
 
 inline bool isKeyChar(char c)
 {
-	return ('a' <= c && c <= 'z')
-		|| ('A' <= c && c <= 'Z')
-		|| ('0' <= c && c <= '9')
-		|| c == '-'
-		|| c == '.'
-		|| c == '_';
-}
-
-inline bool isKey(std::string_view view)
-{
-	if (view.empty())
-		return false;
-
-	if (!isAlpha(view.front()))
-		return false;
-
-	for (char c : view.substr(1))
-		if (!isKeyChar(c))
-			return false;
-
-	return true;
+	return isAlpha(c) || isDigit(c) || c == '-' || c == '.' || c == '_';
 }
 
 
@@ -221,12 +165,21 @@ inline Whitespace tab(int count = 1)
 
 class Stream
 {
+	// Accepts nullptr.
+	// Bounds-checked.
+
 	public:
 
-		Stream(const char* data, Size begin, Size end) :
+		Stream() = default;
+
+		Stream(const char* data, std::size_t count, std::size_t pos = 0) :
 			data_{data},
-			pos_{begin},
-			end_{end}
+			end_{count},
+			pos_{std::min(pos, count)}
+		{}
+
+		explicit Stream(std::string_view view) :
+			Stream{view.data(), view.size()}
 		{}
 
 		const char* data() const
@@ -234,30 +187,27 @@ class Stream
 			return data_;
 		}
 
-		Size pos() const
+		std::size_t pos() const
 		{
 			return pos_;
 		}
 
-		bool isEof() const
+		bool eof() const
 		{
-			return pos_ == end_;
+			return pos_ >= end_;
 		}
 
-		// Bounds-checked
 		char peek() const
 		{
 			return pos_ < end_ ? data_[pos_] : 0;
 		}
 
-		// Bounds-checked
-		char peek(Size offset) const
+		char peek(std::size_t offset) const
 		{
 			return (end_ - pos_ > offset) ? data_[pos_ + offset] : 0;
 		}
 
-		// Bounds-checked
-		void skip(Size count = 1)
+		void skip(std::size_t count = 1)
 		{
 			pos_ += std::min(end_ - pos_, count);
 		}
@@ -290,7 +240,7 @@ class Stream
 			return true;
 		}
 
-		bool acceptHexdigs(Size count)
+		bool acceptHexdigs(std::size_t count)
 		{
 			while (count-- > 0)
 			{
@@ -327,16 +277,16 @@ class Stream
 
 			unsigned char min{0x80};
 			unsigned char max{0xBF};
-			unsigned char count{1};
+			int count{1};
 
-			if      (0xC2 <= b && b <= 0xDF) { count = 2; }
-			else if (0xE0 == b) { min = 0xA0; count = 3; }
-			else if (0xE1 <= b && b <= 0xEC) { count = 3; }
-			else if (0xED == b) { max = 0x9F; count = 3; }
-			else if (0xEE <= b && b <= 0xEF) { count = 3; }
-			else if (0xF0 == b) { min = 0x90; count = 4; }
-			else if (0xF1 <= b && b <= 0xF3) { count = 4; }
-			else if (0xF4 == b) { max = 0x8F; count = 4; }
+			if      (0xC2 <= b &&  b <= 0xDF) { count = 2; }
+			else if (0xE0 == b) { min = 0xA0;   count = 3; }
+			else if (0xE1 <= b &&  b <= 0xEC) { count = 3; }
+			else if (0xED == b) { max = 0x9F;   count = 3; }
+			else if (0xEE <= b &&  b <= 0xEF) { count = 3; }
+			else if (0xF0 == b) { min = 0x90;   count = 4; }
+			else if (0xF1 <= b &&  b <= 0xF3) { count = 4; }
+			else if (0xF4 == b) { max = 0x8F;   count = 4; }
 			else return false;
 
 			skip();
@@ -364,32 +314,50 @@ class Stream
 				case 't': skip(); return true;
 				case 'u': skip(); return acceptHexdigs(4);
 				case 'U': skip(); return acceptHexdigs(8);
-				default: return false;
+				default:          return false;
 			}
 		}
 
 	private:
 
-		const char* data_;
-
-		Size pos_;
-		Size end_;
+		const char* data_{nullptr};
+		std::size_t end_{0};
+		std::size_t pos_{0};
 };
 
 
-class Tokenizer;
 class Token
 {
-	friend Tokenizer;
-
 	public:
 
-		Size pos() const
+		enum class Type
+		{
+			bad,
+			eof,
+			key,
+			boolNo,
+			boolYes,
+			numHex,
+			numIntPos,
+			numIntNeg,
+			numFloat,
+			strLiteral,
+			strEscaped
+		};
+
+		Token(const char* data, std::size_t pos, std::size_t size, Type type) :
+			data_{data},
+			pos_{pos},
+			size_{size},
+			type_{type}
+		{}
+
+		std::size_t pos() const
 		{
 			return pos_;
 		}
 
-		Size size() const
+		std::size_t size() const
 		{
 			return size_;
 		}
@@ -430,8 +398,8 @@ class Token
 					if constexpr (std::is_unsigned_v<T>)
 						return false;
 					[[fallthrough]];
-				case Type::numIntPos: return readInt(target, 10, 0);
-				case Type::numHex:    return readInt(target, 16, 2);
+				case Type::numIntPos: return rawInt(target, 10, 0);
+				case Type::numHex:    return rawInt(target, 16, 2);
 				default: return false;
 			}
 		}
@@ -443,7 +411,7 @@ class Token
 			{
 				case Type::numIntPos:
 				case Type::numIntNeg:
-				case Type::numFloat: return readFloat<T>(target);
+				case Type::numFloat: return rawFloat<T>(target);
 				default: return false;
 			}
 		}
@@ -452,8 +420,8 @@ class Token
 		{
 			switch (type_)
 			{
-				case Type::strLiteral: return readLiteralString(target);
-				case Type::strEscaped: return readEscapedString(target);
+				case Type::strLiteral: return rawLiteralString(target);
+				case Type::strEscaped: return rawEscapedString(target);
 				default: return false;
 			}
 		}
@@ -462,43 +430,20 @@ class Token
 		{
 			switch (type_)
 			{
-				case Type::strLiteral: return readLiteralString(target);
+				case Type::strLiteral: return rawLiteralString(target);
 				default: return false;
 			}
 		}
 
 	private:
 
-		enum class Type
-		{
-			bad,
-			eof,
-			key,
-			boolNo,
-			boolYes,
-			numHex,
-			numIntPos,
-			numIntNeg,
-			numFloat,
-			strLiteral,
-			strEscaped
-		};
-
 		const char* data_;
-
-		Size pos_;
-		Size size_;
+		std::size_t pos_;
+		std::size_t size_;
 		Type type_;
 
-		Token(const char* data, Size pos, Size size, Type type) :
-			data_{data},
-			pos_{pos},
-			size_{size},
-			type_{type}
-		{}
-
 		template<typename T>
-		bool readInt(T& target, int base, int prefix) const
+		bool rawInt(T& target, int base, int prefix) const
 		{
 			T i{};
 			const char* const begin{data_ + pos_ + prefix};
@@ -513,7 +458,7 @@ class Token
 		}
 
 		template<typename T>
-		bool readFloat(T& target) const
+		bool rawFloat(T& target) const
 		{
 			// TODO: Replace with C++17 std::from_chars()
 			errno = 0;
@@ -532,13 +477,13 @@ class Token
 		}
 
 		template<typename T>
-		bool readLiteralString(T& target) const
+		bool rawLiteralString(T& target) const
 		{
 			target = T{data_ + pos_ + 1, size_ - 2};
 			return true;
 		}
 
-		bool readEscapedString(std::string& target) const
+		bool rawEscapedString(std::string& target) const
 		{
 			enum class State{ copy, esc, hex };
 			State state{State::copy};
@@ -549,11 +494,9 @@ class Token
 			std::string out{};
 			out.reserve(size_ - 2);
 
-			const Size begin{pos_ + 1};
-			const Size end{pos_ + size_ - 1};
-			for (Size i{begin}; i < end; ++i)
+			for (std::size_t i{1}; i < size_ - 1; ++i)
 			{
-				const char c{data_[i]};
+				const char c{data_[pos_ + i]};
 				switch (state)
 				{
 					case State::copy:
@@ -599,7 +542,7 @@ class Token
 			if (state != State::copy)
 				return false;
 
-			target = out;
+			target = std::move(out);
 			return true;
 		}
 
@@ -645,7 +588,9 @@ class Tokenizer
 
 	public:
 
-		Tokenizer(Stream stream, bool skipUtf8Bom = false) :
+		Tokenizer() = default;
+
+		explicit Tokenizer(Stream stream, bool skipUtf8Bom = false) :
 			stream_{std::move(stream)}
 		{
 			if (skipUtf8Bom
@@ -655,15 +600,21 @@ class Tokenizer
 				stream_.skip(3);
 		}
 
+		std::size_t pos() const
+		{
+			return stream_.pos();
+		}
+
 		Token get()
 		{
 			while (isWs(stream_.peek()))
 				stream_.skip();
 
-			if (stream_.isEof())
-				return {stream_.data(), stream_.pos(), 0, Type::eof};
-
 			tokenPos_ = stream_.pos();
+
+			if (stream_.eof())
+				return make(Type::eof);
+
 			switch (stream_.peek())
 			{
 				case '-':
@@ -677,25 +628,20 @@ class Tokenizer
 				case '8':
 				case '9':
 					return scanDec();
-
 				case '0':
 					return (stream_.peek(1) == 'x')
 						? scanHex()
 						: scanDec();
-
 				case 'n':
 					return (stream_.peek(1) == 'o' && stream_.peek(2) != ':')
 						? scanNo()
 						: scanOther();
-
 				case 'y':
 					return (stream_.peek(1) == 'e' && stream_.peek(2) == 's' && stream_.peek(3) != ':')
 						? scanYes()
 						: scanOther();
-
 				case '"':
 					return scanString();
-
 				default:
 					return scanOther();
 			}
@@ -703,12 +649,12 @@ class Tokenizer
 
 	private:
 
-		Stream stream_;
-		Size tokenPos_{0};
+		Stream stream_{};
+		std::size_t tokenPos_{0};
 
 		Token make(Type type, bool isWsTerminated = false) const
 		{
-			if (isWsTerminated && !stream_.isEof() && !isWs(stream_.peek()))
+			if (isWsTerminated && !stream_.eof() && !isWs(stream_.peek()))
 				type = Type::bad;
 
 			return {stream_.data(), tokenPos_, stream_.pos() - tokenPos_, type};
@@ -769,7 +715,7 @@ class Tokenizer
 			Type type{Type::strLiteral};
 
 			stream_.skip();
-			while (!stream_.isEof() && stream_.peek() != '"')
+			while (!stream_.eof() && stream_.peek() != '"')
 			{
 				if (stream_.accept('\\'))
 				{
@@ -807,245 +753,47 @@ class Tokenizer
 };
 
 
-class Buffer;
-class Lookup
-{
-	friend Buffer;
-
-	// -----------------------------
-	// KEYNAME: VALUE       NEXTKEY:
-	// |------^------^------^-------
-	// pos  colon  cursor  size
-
-	Size pos;
-	Size colon;
-	Size cursor;
-	Size size;
-
-	Lookup(Size pos, Size colon, Size size) :
-		pos{pos},
-		colon{colon},
-		cursor{size},
-		size{size}
-	{}
-
-	std::string_view keyView(const char* data) const
-	{
-		return {data + pos, colon};
-	}
-
-	std::string_view dumpView(const char* data) const
-	{
-		return {data + pos, cursor};
-	}
-
-	struct Less
-	{
-		const char* data;
-
-		bool operator()(const Lookup& a, const Lookup& b) const
-		{
-			return a.keyView(data) < b.keyView(data);
-		}
-
-		bool operator()(const Lookup& a, const std::string_view& b) const
-		{
-			return a.keyView(data) < b;
-		}
-	};
-
-	struct Equal
-	{
-		const char* data;
-
-		bool operator()(const Lookup& a, const Lookup& b) const
-		{
-			return a.keyView(data) == b.keyView(data);
-		}
-
-		bool operator()(const Lookup& a, const std::string_view& b) const
-		{
-			return a.keyView(data) == b;
-		}
-	};
-};
-
-
-class Buffer
+class Appender
 {
 	public:
 
-		Buffer(std::string data, std::size_t maxItemCount) :
-			maxItemCount_{maxItemCount}
+		explicit Appender(std::string& target) :
+			target_{target}
+		{}
+
+		bool append(const Whitespace& value)
 		{
-			if (data.size() > std::numeric_limits<Size>::max())
-				return;
+			if (!isWs(value.value) || value.count < 1)
+				return false;
 
-			std::vector<Lookup> lookups{};
-			lookups.reserve(maxItemCount_ > 0 ? maxItemCount_ : 64);
-
-			Stream stream{data.data(), 0, static_cast<Size>(data.size())};
-			Tokenizer tokenizer{stream, true};
-			Size prevKeyPos{0};
-			Size prevKeySize{0};
-
-			while (true)
-			{
-				const Token token{tokenizer.get()};
-
-				if (token.isKey() || token.isEof())
-				{
-					if (prevKeySize != 0)
-					{
-						const Size size{token.pos() - prevKeyPos};
-						const Lookup lookup{prevKeyPos, prevKeySize, size};
-						if (maxItemCount_ > 0 && lookups.size() >= maxItemCount)
-							return;
-						lookups.push_back(lookup);
-					}
-
-					if (token.isEof())
-						break;
-
-					prevKeyPos = token.pos();
-					prevKeySize = token.size();
-				}
-				else if (!token.isValue())
-					return;
-				else if (prevKeySize == 0)
-					return;
-			}
-
-			// Sort items
-			const Lookup::Less less{data.data()};
-			std::sort(lookups.begin(), lookups.end(), less);
-
-			// Check duplicate key
-			const Lookup::Equal equal{data.data()};
-			auto it{std::adjacent_find(lookups.begin(), lookups.end(), equal)};
-			if (it != lookups.end())
-				return;
-
-			data_ = std::move(data);
-			lookups_ = std::move(lookups);
-			isOk_ = true;
+			return rawWhitespace(value.value, value.count);
 		}
 
-		explicit operator bool() const
+		bool append(const bool& value)
 		{
-			return isOk_;
-		}
-
-		Lookup& operator[](std::string_view key)
-		{
-			const Lookup::Less less{data_.data()};
-			const Lookup::Equal equal{data_.data()};
-			auto it{std::lower_bound(lookups_.begin(), lookups_.end(), key, less)};
-
-			if (it != lookups_.end() && equal(*it, key))
-				return *it;
-
-			if (maxItemCount_ > 0 && lookups_.size() >= maxItemCount_)
-				return null_;
-
-			if (!isKey(key))
-				return null_;
-
-			const Size dataMax{std::numeric_limits<Size>::max()};
-			const Size dataSize{static_cast<Size>(data_.size())};
-
-			if (key.size() >= dataMax - dataSize)
-				return null_;
-
-			const Size pos{static_cast<Size>(data_.size())};
-			const Size colon{static_cast<Size>(key.size())};
-
-			data_.append(key);
-			data_.push_back(':');
-
-			Lookup lookup{pos, colon, colon+1};
-			return *(lookups_.insert(it, lookup));
-		}
-
-		void clear(Lookup& lookup)
-		{
-			if (lookup.colon == 0)
-				return;
-
-			lookup.cursor = lookup.colon + 1;
-		}
-
-		bool isOk(Lookup& lookup) const
-		{
-			return lookup.colon != 0;
-		}
-
-		Tokenizer tokenize(Lookup& lookup) const
-		{
-			if (lookup.colon == 0)
-				return {Stream{data_.data(), 0, 0}};
-
-			const Size begin{lookup.pos + lookup.colon + 1};
-			const Size end{lookup.pos + lookup.cursor};
-			return {Stream{data_.data(), begin, end}};
-		}
-
-		std::string dump() const
-		{
-			Size size{0};
-
-			for(const Lookup& lookup : lookups_)
-			{
-				std::string_view view{lookup.dumpView(data_.data())};
-				while (isNonNlWs(view.back()))
-					view.remove_suffix(1);
-
-				size += view.size();
-				if (view.back() != '\n')
-					size += 1;
-			}
-
-			std::string out{};
-			out.reserve(size);
-
-			for(const Lookup& lookup : lookups_)
-			{
-				std::string_view view{lookup.dumpView(data_.data())};
-				while (isNonNlWs(view.back()))
-					view.remove_suffix(1);
-
-				out.append(view);
-				if (view.back() != '\n')
-					out.push_back('\n');
-			}
-
-			return out;
-		}
-
-		bool write(Lookup& lookup, const bool& value)
-		{
-			return value
-				? writeRaw(lookup, "yes", 3)
-				: writeRaw(lookup, "no", 2);
+			return value ? rawValue("yes", 3) : rawValue("no", 2);
 		}
 
 		template<typename T, IsInt<T> = true>
-		bool write(Lookup& lookup, const T& value)
+		bool append(const T& value)
 		{
-			return write(lookup, IntValue<T>{value, false, 0});
+			return append(IntValue<T>{value, false, 0});
 		}
 
 		template<typename T>
-		bool write(Lookup& lookup, const IntValue<T>& value)
+		bool append(const IntValue<T>& value)
 		{
-			const int base{value.isHex ? 16 : 10};
-			const int width{std::clamp(value.width, 1, 16)};
+			if (value.isHex && value.value < 0)
+				return false;
 
-			// The digits are written in the second half,
-			// the hex prefix and padding in the first half.
-			std::array<char, 48> temp;  // Enough for int64
-			char* begin{temp.data() + temp.size()/2};
+			// Write to temporary buffer. The digits are written in the
+			// second half, the hex prefix and padding in the first half.
+			constexpr int half{24}; // Enough for int64
+			std::array<char, half*2> temp;
+
+			char* begin{temp.data() + half};
 			char* end{temp.data() + temp.size()};
+			const int base{value.isHex ? 16 : 10};
 			auto result{std::to_chars(begin, end, value.value, base)};
 
 			if (result.ec != std::errc{})
@@ -1053,24 +801,26 @@ class Buffer
 
 			if (value.isHex)
 			{
-				int digits{static_cast<int>(result.ptr - begin)};
-				int prefix{2 + std::max(0, width - digits)};
-				while (begin != temp.data() && --prefix >= 0)
+				const int digits{static_cast<int>(result.ptr - begin)};
+				int prefix{std::clamp(2 + value.width - digits, 2, half)};
+
+				while (prefix-- > 2)
 					*(--begin) = '0';
-				*(begin + 1) = 'x';
+				*(--begin) = 'x';
+				*(--begin) = '0';
 			}
 
-			return writeRaw(lookup, begin, result.ptr - begin);
+			return rawValue(begin, static_cast<std::size_t>(result.ptr - begin));
 		}
 
 		template<typename T, IsFloat<T> = true>
-		bool write(Lookup& lookup, const T& value)
+		bool append(const T& value)
 		{
-			return write(lookup, FloatValue<T>{value, 6, false});
+			return append(FloatValue<T>{value, 6, false});
 		}
 
 		template<typename T>
-		bool write(Lookup& lookup, const FloatValue<T>& value)
+		bool append(const FloatValue<T>& value)
 		{
 			if (std::isinf(value.value) || std::isnan(value.value))
 				return false;
@@ -1084,88 +834,50 @@ class Buffer
 			if (value.isFixed)
 				stream << std::fixed;
 			stream << static_cast<double>(value.value);
-			const std::string string{stream.str()};
+			const std::string temp{stream.str()};
 
-			return writeRaw(lookup, string.data(), string.size());
+			return rawValue(temp.data(), temp.size());
 		}
 
-		bool write(Lookup& lookup, const Whitespace& value)
+		bool append(const char* const& value)
 		{
-			if (!isWs(value.value))
-				return false;
-
-			if (value.count < 1)
-				return true;
-
-			return writeRaw(lookup, value.value, value.count);
+			return append(std::string_view{value});
 		}
 
-		bool write(Lookup& lookup, const char* const& value)
+		bool append(const std::string_view& value)
 		{
-			return write(lookup, std::string_view{value});
-		}
-
-		bool write(Lookup& lookup, const std::string_view& value)
-		{
-			return writeRawString(lookup, value.data(), value.size());
+			return rawString(value.data(), value.size());
 		}
 
 	private:
 
-		std::string data_{};
+		std::string& target_;
 
-		// INVARIANT: Lookups are sorted in ascending order.
-		// INVARIANT: Lookups have unique keys.
-		std::vector<Lookup> lookups_{};
-		Lookup null_{0, 0, 0};
-
-		std::size_t maxItemCount_{0};
-		bool isOk_{false};
-
-		bool writeRaw(Lookup& lookup, char ch, Size count)
+		void rawSeparator()
 		{
-			if (lookup.colon == 0)
-				return false;
+			if (!target_.empty() && !isWs(target_.back()))
+				target_.push_back(' ');
+		}
 
-			if (!reserveRaw(lookup, count))
-				return false;
-
-			replaceRaw(lookup, ch, count);
+		bool rawWhitespace(char ch, std::size_t count)
+		{
+			target_.append(count, ch);
 			return true;
 		}
 
-		bool writeRaw(Lookup& lookup, const char* data, Size count)
+		bool rawValue(const char* data, std::size_t count)
 		{
-			if (lookup.colon == 0)
-				return false;
-
-			if (isWs(data_[lookup.pos + lookup.cursor - 1]))
-			{
-				if (!reserveRaw(lookup, count))
-					return false;
-			}
-			else
-			{
-				if (!canAdd(count, 1))
-					return false;
-				if (!reserveRaw(lookup, count + 1))
-					return false;
-				replaceRaw(lookup, ' ');
-			}
-
-			replaceRaw(lookup, data, count);
+			rawSeparator();
+			target_.append(data, count);
 			return true;
 		}
 
-		bool writeRawString(Lookup& lookup, const char* data, Size count)
+		bool rawString(const char* data, std::size_t count)
 		{
-			if (lookup.colon == 0)
-				return false;
+			Stream stream{data, count};
+			std::size_t escCount{0};
 
-			Size escCount{0};
-			Stream stream{data, 0, count};
-
-			while (!stream.isEof())
+			while (!stream.eof())
 			{
 				if (stream.accept('"') || stream.accept('\\'))
 					++escCount;
@@ -1173,95 +885,95 @@ class Buffer
 					return false;
 			}
 
-			if (!canAdd(count, escCount))
-				return false;
-
-			if (isWs(data_[lookup.pos + lookup.cursor - 1]))
-			{
-				if (!canAdd(count + escCount, 2))
-					return false;
-				if (!reserveRaw(lookup, count + escCount + 2))
-					return false;
-			}
-			else
-			{
-				if (!canAdd(count + escCount, 3))
-					return false;
-				if (!reserveRaw(lookup, count + escCount + 3))
-					return false;
-				replaceRaw(lookup, ' ');
-			}
-
-			replaceRaw(lookup, '"');
+			rawSeparator();
+			target_.push_back('"');
 
 			if (escCount == 0)
-				replaceRaw(lookup, data, count);
+				target_.append(data, count);
 			else
 			{
-				for (Size i{0}; i < count; ++i)
+				for (std::size_t i{0}; i < count; ++i)
 				{
 					if (data[i] == '"' || data[i] == '\\')
-						replaceRaw(lookup, '\\');
-					replaceRaw(lookup, data[i]);
+						target_.push_back('\\');
+					target_.push_back(data[i]);
 				}
 			}
 
-			replaceRaw(lookup, '"');
+			target_.push_back('"');
 			return true;
 		}
+};
 
-		bool canAdd(Size a, Size b) const
+
+class Lookup
+{
+	public:
+
+		struct Less
 		{
-			return a <= std::numeric_limits<Size>::max() - b;
-		}
+			const char* data;
 
-		bool reserveRaw(Lookup& lookup, Size count)
-		{
-			const Size itemVacant{lookup.size - lookup.cursor};
-
-			if (count <= itemVacant)
-				return true;
-
-			const Size dataMax{std::numeric_limits<Size>::max()};
-			const Size dataSize{static_cast<Size>(data_.size())};
-			const Size dataVacant{dataMax - dataSize};
-			const Size itemNeeded{count - itemVacant};
-
-			if (itemNeeded > dataVacant)
-				return false;
-
-			// Add extra bytes to postpone the next costly insertion.
-			const Size itemUsed{lookup.size - lookup.colon + itemNeeded};
-			const Size extraMax{dataVacant - itemNeeded};
-			const Size extraSize{std::min(std::max<Size>(16, itemUsed), extraMax)};
-			const Size addSize{itemNeeded + extraSize};
-			const Size addPos{lookup.pos + lookup.size};
-
-			if (addPos == data_.size())
-				data_.append(addSize, char{});
-			else
+			bool operator()(const Lookup& a, const Lookup& b) const
 			{
-				data_.insert(addPos, addSize, char{});
-				for (Lookup& lookup : lookups_)
-					if (lookup.pos >= addPos)
-						lookup.pos += addSize;
+				return a.keyView(data) < b.keyView(data);
 			}
 
-			lookup.size += addSize;
-			return true;
+			bool operator()(const Lookup& a, const std::string_view& b) const
+			{
+				return a.keyView(data) < b;
+			}
+		};
+
+		struct Equal
+		{
+			const char* data;
+
+			bool operator()(const Lookup& a, const Lookup& b) const
+			{
+				return a.keyView(data) == b.keyView(data);
+			}
+
+			bool operator()(const Lookup& a, const std::string_view& b) const
+			{
+				return a.keyView(data) == b;
+			}
+		};
+
+		Lookup() = default;
+
+		Lookup(std::size_t keyPos, std::size_t keySize, std::size_t itemSize)
+		{
+			if (keyPos > 0xFFFFFFFFu || keySize > 0xFFu || itemSize > 0xFFFFFFu)
+				return;
+
+			pos_   = static_cast<std::uint32_t>(keyPos);
+			sizes_ = static_cast<std::uint32_t>(keySize | (itemSize << 8));
 		}
 
-		void replaceRaw(Lookup& lookup, char c, Size count = 1)
+		explicit operator bool() const
 		{
-			data_.replace(lookup.pos + lookup.cursor, count, count, c);
-			lookup.cursor += count;
+			return sizes_ > 0;
 		}
 
-		void replaceRaw(Lookup& lookup, const char* data, Size count)
+		std::string_view keyView(const char* data) const
 		{
-			data_.replace(lookup.pos + lookup.cursor, count, data, count);
-			lookup.cursor += count;
+			return {data + pos_, sizes_ & 0xFF};
 		}
+
+		std::string_view valView(const char* data) const
+		{
+			const std::size_t valPos{pos_ + (sizes_ & 0xFF) + 1};
+			const std::size_t valEnd{pos_ + (sizes_ >> 8)};
+			return {data + valPos, valEnd - valPos};
+		}
+
+	private:
+
+		std::uint32_t pos_{0};
+		std::uint32_t sizes_{0};
+		// Item size in FFFFFF00
+		// Key  size in 000000FF
 };
 
 
@@ -1276,116 +988,347 @@ class Item
 	public:
 
 		// Checks if the item is active after construction,
-		// or if the previous read or write was successul.
+		// or if the most recent read or write was successul.
 		explicit operator bool() const
 		{
-			return isOk_ && buffer_.isOk(lookup_);
+			return values_ != nullptr && isOk_;
 		}
 
 		// Reads the next value and assigns it to a standard bool,
 		// integral, floating-point, string, or string_view variable.
 		// If the read fails, the target variable is left unchanged.
-		// A string_view cannot contain any escape sequence and only
-		// remains valid until the document is altered.
-		// The read position is reset after each write.
+		// A string_view cannot contain any escape sequence and
+		// remains valid until the item is altered.
+		// Resets the write position.
 		template<typename T>
 		Item& operator>>(T& target)
 		{
-			if (!isReading_)
-			{
-				tokenizer_ = buffer_.tokenize(lookup_);
-				isReading_ = true;
-			}
+			if (values_ == nullptr)
+				return *this;
 
-			isOk_ = tokenizer_.get().read(target);
+			Tokenizer tokenizer{Stream{values_->data(), values_->size(), readPos_}};
+			isOk_ = tokenizer.get().read(target);
+			readPos_ = tokenizer.pos();
+			isReading_ = true;
 			return *this;
+
 		}
 
 		// Appends a standard bool, integral, floating-point,
 		// string, or string_view value. Invalid values are ignored.
-		// For strings, any double quote or backslash is escaped.
-		// The write position is reset after each read.
+		// Within strings, any double quote or backslash is escaped.
+		// Resets the read position.
 		template<typename T>
 		Item& operator<<(const T& value)
 		{
-			if (isReading_)
-			{
-				buffer_.clear(lookup_);
-				isReading_ = false;
-			}
+			if (values_ == nullptr)
+				return *this;
 
-			isOk_ = buffer_.write(lookup_, value);
+			if (isReading_)
+				values_->clear();
+
+			Appender appender{*values_};
+			isOk_ = appender.append(value);
+			readPos_ = 0;
+			isReading_ = false;
 			return *this;
 		}
 
 	private:
 
-		Buffer& buffer_;
-		Lookup& lookup_;
-
-		Tokenizer tokenizer_;
-
-		bool isOk_{true};
+		std::string* values_{nullptr};
+		std::size_t readPos_{0};
 		bool isReading_{true};
+		bool isOk_{true};
 
-		Item(Buffer& buffer, Lookup& lookup) :
-			buffer_{buffer},
-			lookup_{lookup},
-			tokenizer_{buffer_.tokenize(lookup_)}
+		Item() = default;
+
+		explicit Item(std::string* values) :
+			values_{values}
 		{}
 };
 
 
 class Document
 {
+	// A general purpose class which owns and manages its data.
+	// New items can be inserted. Values can be read and written.
+	// Item lookup has logarithmic complexity.
+
 	public:
 
 		// Constructs an empty document.
 		Document() :
-			Document{std::string{}}
+			isOk_{true}
 		{}
 
-		// Takes ownership of a KCV string and parses it.
-		// If the parsing fails, or the non-zero maxItemCount
-		// is exceeded, an empty document is constructed instead.
-		// The string size is limited to 4 GiB.
-		explicit Document(std::string data, std::size_t maxItemCount = 0) :
-			buffer_{std::move(data), maxItemCount}
-		{}
+		// Parses a KCV string. If the parsing fails, or the non-zero
+		// maxItemCount is exceeded, an empty document is constructed.
+		explicit Document(std::string_view data, std::size_t maxItemCount = 0)
+		{
+			Map items{};
+
+			Tokenizer tokenizer{Stream{data}, true};
+			std::size_t keyPos{0};
+			std::size_t keySize{0};
+
+			while (true)
+			{
+				const Token token{tokenizer.get()};
+
+				if (token.isKey() || token.isEof())
+				{
+					if (keySize != 0)
+					{
+						if (maxItemCount > 0 && items.size() >= maxItemCount)
+							return;
+
+						const std::size_t valPos{keyPos + keySize + 1};
+						const std::size_t valSize{token.pos() - valPos};
+
+						auto result{items.try_emplace(
+							std::string{data.substr(keyPos, keySize)},
+							std::string{data.substr(valPos, valSize)} )};
+
+						if (!result.second)
+							return;
+					}
+
+					if (token.isEof())
+						break;
+
+					keyPos = token.pos();
+					keySize = token.size();
+				}
+				else if (!token.isValue())
+					return;
+				else if (keySize == 0)
+					return;
+			}
+
+			items_ = std::move(items);
+			isOk_ = true;
+		}
 
 		// Checks if the constructor accepted the data string.
 		explicit operator bool() const
 		{
-			return static_cast<bool>(buffer_);
+			return isOk_;
 		}
 
-		// Retrieves an item. If the key does not exist, a new
-		// item is inserted. If the key is invalid, or the non-zero
-		// maxItemCount is exceeded, an inactive item is returned.
-		//
-		// IMPORTANT: Only use the most recent Item instance.
-		// Old Item instances may contain invalidated references.
-		//
+		// Retrieves an item. If the key does not exist, a new item is
+		// inserted. If the key is invalid, an inactive item is returned.
 		Item operator[](std::string_view key)
 		{
-			return {buffer_, buffer_[key]};
+			auto found{items_.find(key)};
+			if (found != items_.end())
+				return Item{&(found->second)};
+
+			if (key.empty())
+				return {};
+
+			if (!isAlpha(key[0]))
+				return {};
+
+			for (std::size_t i{1}; i < key.size(); ++i)
+				if (!isKeyChar(key[i]))
+					return {};
+
+			auto emplaced{items_.try_emplace(std::string{key}, std::string{})};
+			return Item{&(emplaced.first->second)};
 		}
 
-		// Converts the document to a string.
+		// Writes the document to a string.
 		// The items are ordered lexicographically.
 		std::string dump() const
 		{
-			return buffer_.dump();
+			std::size_t size{0};
+
+			for(const auto& [key, values] : items_)
+			{
+				size += key.size();
+				size += 1;
+				if (!values.empty() && !isWs(values.front()))
+					size += 1;
+				size += values.size();
+				if (values.empty() || values.back() != '\n')
+					size += 1;
+			}
+
+			std::string out{};
+			out.reserve(size);
+
+			for(const auto& [key, values] : items_)
+			{
+				out.append(key);
+				out.push_back(':');
+				if (!values.empty() && !isWs(values.front()))
+					out.push_back(' ');
+				out.append(values);
+				if (values.empty() || values.back() != '\n')
+					out.push_back('\n');
+			}
+
+			return out;
 		}
 
 	private:
 
-		Buffer buffer_;
+		using Map = std::map<std::string, std::string, std::less<>>;
+
+		Map items_{};
+		bool isOk_{false};
 };
 
 
+template<std::size_t>
+class DocumentView;
+class ItemView
+{
+	template<std::size_t>
+	friend class DocumentView;
+
+	public:
+
+		// Checks if the item is active after construction,
+		// or if the most recent read or write was successul.
+		explicit operator bool() const
+		{
+			return isOk_;
+		}
+
+		// Reads the next value and assigns it to a standard bool,
+		// integral, floating-point, string, or string_view variable.
+		// If the read fails, the target variable is left unchanged.
+		// A string_view cannot contain any escape sequence.
+		template<typename T>
+		ItemView& operator>>(T& target)
+		{
+			isOk_ = isOk_ && tokenizer_.get().read(target);
+			return *this;
+		}
+
+	private:
+
+		Tokenizer tokenizer_{};
+		bool isOk_{false};
+
+		ItemView() = default;
+
+		explicit ItemView(Tokenizer tokenizer) :
+			tokenizer_{tokenizer},
+			isOk_{true}
+		{}
+};
+
+
+template<std::size_t MaxItemCount>
+class DocumentView
+{
+	// A read-only class which does not own or allocate data.
+	// Remains valid as long as the provided data string_view.
+	// Stores MaxItemCount*64 bits of metadata on the stack.
+	// The data string size is limited to 4 GiB, the item
+	// size to 16 MiB, and the key size to 255 bytes.
+	// Item lookup has logarithmic complexity.
+
+	public:
+
+		// Constructs an empty document.
+		DocumentView() :
+			isOk_{true}
+		{}
+
+		// Parses a KCV string. If the parsing fails, or MaxItemCount
+		// is exceeded, the document is considered empty.
+		explicit DocumentView(std::string_view data)
+		{
+			Tokenizer tokenizer{Stream{data}, true};
+			std::size_t keyPos{0};
+			std::size_t keySize{0};
+
+			while (true)
+			{
+				const Token token{tokenizer.get()};
+
+				if (token.isKey() || token.isEof())
+				{
+					if (keySize != 0)
+					{
+						Lookup lookup{keyPos, keySize, token.pos() - keyPos};
+
+						if (!lookup || end_ == lookups_.end())
+							return;
+
+						*end_++ = lookup;
+					}
+
+					if (token.isEof())
+						break;
+
+					keyPos = token.pos();
+					keySize = token.size();
+				}
+				else if (!token.isValue())
+					return;
+				else if (keySize == 0)
+					return;
+			}
+
+			// Sort items
+			const Lookup::Less less{data.data()};
+			std::sort(lookups_.begin(), end_, less);
+
+			// Reject duplicate keys
+			const Lookup::Equal equal{data.data()};
+			if (std::adjacent_find(lookups_.begin(), end_, equal) != end_)
+				return;
+
+			data_ = data.data();
+			isOk_ = true;
+		}
+
+		// Checks if the constructor accepted the data string.
+		explicit operator bool() const
+		{
+			return isOk_;
+		}
+
+		// Retrieves an item. If the key does not exist,
+		// an inactive item is returned.
+		ItemView operator[](std::string_view key)
+		{
+			if (isOk_ && data_ != nullptr)
+			{
+				const Lookup::Less less{data_};
+				const Lookup::Equal equal{data_};
+				auto it{std::lower_bound(lookups_.begin(), end_, key, less)};
+
+				if (it != end_ && equal(*it, key))
+					return ItemView{Tokenizer{Stream{it->valView(data_)}}};
+			}
+
+			return {};
+		}
+
+	private:
+
+		using Array = std::array<Lookup, MaxItemCount>;
+		using ArrayIt = typename Array::iterator;
+
+		const char* data_{nullptr};
+
+		Array lookups_{};
+		ArrayIt end_{lookups_.begin()};
+
+		bool isOk_{false};
+};
+
 } // namespace detail
 
+
+using detail::DocumentView;
+using detail::ItemView;
 
 using detail::Document;
 using detail::Item;
